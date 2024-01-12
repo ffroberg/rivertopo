@@ -6,6 +6,7 @@ from rivertopo.profile import RegulativProfilSimpel, RegulativProfilSammensat, O
 from rivertopo.snapping import snap_points
 from numpy import array_equal
 from scipy.interpolate import RegularGridInterpolator
+from rivertopo.topology import get_layer_topology
 
 """
 This script generates line objects with z-values by interpolating z-values from cross-sectional data. 
@@ -76,16 +77,15 @@ def create_perpendicular_lines(point1_geometry, point2_geometry, length=30):
     :param length: The length of the perpendicular line (default is 30 meters).
     :return: Offsets, parameter t, and coordinates of the endpoints of the perpendicular line.
     """
-            # # Check the type of the two points
-        # if point1_geometry.GetGeometryName() == 'LINESTRING' and point2_geometry.GetGeometryName() == 'LINESTRING':
-        #     # If they are LINESTRINGs, get the center point
-        #     x1, y1 = calculate_center(point1_geometry)[0], calculate_center(point1_geometry)[1]
-        #     x2, y2 = calculate_center(point2_geometry)[0], calculate_center(point2_geometry)[1]
-        # else:
-        #     # If not, just get the first point as usual
-        #     x1, y1 = point1_geometry.GetX(), point1_geometry.GetY()
-        #     x2, y2 = point2_geometry.GetX(), point2_geometry.GetY()
-
+    # # Check the type of the two points
+    # if point1_geometry.GetGeometryName() == 'LINESTRING' and point2_geometry.GetGeometryName() == 'LINESTRING':
+    #     # If they are LINESTRINGs, get the center point
+    #     x1, y1 = calculate_center(point1_geometry)[0], calculate_center(point1_geometry)[1]
+    #     x2, y2 = calculate_center(point2_geometry)[0], calculate_center(point2_geometry)[1]
+    # else:
+    #     # If not, just get the first point as usual
+    #     x1, y1 = point1_geometry.GetX(), point1_geometry.GetY()
+    #     x2, y2 = point2_geometry.GetX(), point2_geometry.GetY()
 
     # Get the coordinates of the two points
     x1, y1 = point1_geometry.GetX(), point1_geometry.GetY()
@@ -133,9 +133,16 @@ def create_perpendicular_lines_on_polylines(stream_linestring, stations, length=
     :return: List of perpendicular lines and their attributes.
     """
     perpendicular_lines = []
+    segment_end_points = set()
+
+    # Add all vertices of the linestring to segment_end_points
+    for i in range(stream_linestring.GetPointCount()):
+        point = stream_linestring.GetPoint(i)
+        segment_end_points.add((point[0], point[1]))
+
     cumulative_distance = 0
 
-    # First, create perpendicular lines at each point on the linestring
+    # Create perpendicular lines at each point on the linestring
     for i in range(stream_linestring.GetPointCount() - 1):
         point1 = stream_linestring.GetPoint(i)
         point2 = stream_linestring.GetPoint(i + 1)
@@ -156,13 +163,25 @@ def create_perpendicular_lines_on_polylines(stream_linestring, stations, length=
     for station in stations:
         # Find the segment where this station falls
         segment_distance = 0
+        closest_distance = float('inf') 
+        closest_segment = None
+
         for i in range(stream_linestring.GetPointCount() - 1):
             point1 = stream_linestring.GetPoint(i)
             point2 = stream_linestring.GetPoint(i + 1)
             segment_length = np.hypot(point2[0] - point1[0], point2[1] - point1[1])
+            
+            if abs(segment_distance + segment_length - station) < closest_distance:
+                closest_distance = abs(segment_distance + segment_length - station)
+                closest_segment = i
 
-            if segment_distance + segment_length >= station:
-                # Station falls within this segment
+            segment_distance += segment_length
+
+        if closest_segment is not None:
+            point1 = stream_linestring.GetPoint(closest_segment)
+            point2 = stream_linestring.GetPoint(closest_segment + 1)
+            #add_line_if_valid(point1, point2, station, length, segment_end_points, perpendicular_lines)
+            if (point1[0], point1[1]) in segment_end_points:
                 point1_geometry = ogr.Geometry(ogr.wkbPoint)
                 point1_geometry.AddPoint(*point1)
                 point2_geometry = ogr.Geometry(ogr.wkbPoint)
@@ -170,46 +189,84 @@ def create_perpendicular_lines_on_polylines(stream_linestring, stations, length=
 
                 offset, t, x3, x4, y3, y4 = create_perpendicular_lines(point1_geometry, point2_geometry, length=length)
                 perpendicular_lines.append((offset, t, x3, x4, y3, y4, station))
-                break
-
-            segment_distance += segment_length
-
 
     perpendicular_lines = sorted(perpendicular_lines, key=lambda x: x[-1])
 
     return perpendicular_lines
 
+# def add_line_if_valid(point1, point2, station, length, segment_end_points, perpendicular_lines):
+#     if (point1[0], point1[1]) in segment_end_points:
+#         point1_geometry = ogr.Geometry(ogr.wkbPoint)
+#         point1_geometry.AddPoint(*point1)
+#         point2_geometry = ogr.Geometry(ogr.wkbPoint)
+#         point2_geometry.AddPoint(*point2)
+
+#         offset, t, x3, x4, y3, y4 = create_perpendicular_lines(point1_geometry, point2_geometry, length=length)
+#         perpendicular_lines.append((offset, t, x3, x4, y3, y4, station))
+
+def is_consecutive(station1, station2, threshold=115): # Threshold needs altering for different scenarioes
+    return abs(station2 - station1) <= threshold
 
 def create_lines_with_z(current_line_data, previous_line_data, output_lines_layer):
 
     if previous_line_data is None or current_line_data is None:
         return
 
-    t_curr, z_values_curr, x3_curr, x4_curr, y3_curr, y4_curr, _ = current_line_data
-    t_prev, z_values_prev, x3_prev, x4_prev, y3_prev, y4_prev, _ = previous_line_data
+    t_curr, z_values_curr, x3_curr, x4_curr, y3_curr, y4_curr, station_current = current_line_data
+    t_prev, z_values_prev, x3_prev, x4_prev, y3_prev, y4_prev, station_previous = previous_line_data
 
-    for i in range(len(t_curr)):
-        # Calculate coordinates for point i in the current and previous lines
-        x1 = x3_prev + t_prev[i] * (x4_prev - x3_prev)
-        y1 = y3_prev + t_prev[i] * (y4_prev - y3_prev)
-        z1 = z_values_prev[i]
+    # Check if current and previous stations are consecutive in the river path
+    if is_consecutive(station_previous, station_current):
+        for i in range(len(t_curr)):
+            t_curr, z_values_curr, x3_curr, x4_curr, y3_curr, y4_curr, station_current = current_line_data
+            t_prev, z_values_prev, x3_prev, x4_prev, y3_prev, y4_prev, station_previous = previous_line_data
 
-        x2 = x3_curr + t_curr[i] * (x4_curr - x3_curr)
-        y2 = y3_curr + t_curr[i] * (y4_curr - y3_curr)
-        z2 = z_values_curr[i]
+            # Calculate coordinates for point i in the current and previous lines
+            x1 = x3_prev + t_prev[i] * (x4_prev - x3_prev)
+            y1 = y3_prev + t_prev[i] * (y4_prev - y3_prev)
+            z1 = z_values_prev[i]
 
-        # Create line geometry
-        line_geometry = ogr.Geometry(ogr.wkbLineString25D)
-        line_geometry.AddPoint(x1, y1, z1)
-        line_geometry.AddPoint(x2, y2, z2)
+            x2 = x3_curr + t_curr[i] * (x4_curr - x3_curr)
+            y2 = y3_curr + t_curr[i] * (y4_curr - y3_curr)
+            z2 = z_values_curr[i]
 
-        # Create output feature for cross sections
-        output_line_feature = ogr.Feature(output_lines_layer.GetLayerDefn())
-        output_line_feature.SetGeometry(line_geometry)
-        output_lines_layer.CreateFeature(output_line_feature)
+            # Create line geometry
+            line_geometry = ogr.Geometry(ogr.wkbLineString25D)
+            line_geometry.AddPoint(x1, y1, z1)
+            line_geometry.AddPoint(x2, y2, z2)
+
+            # Create output feature for cross sections
+            output_line_feature = ogr.Feature(output_lines_layer.GetLayerDefn())
+            output_line_feature.SetGeometry(line_geometry)
+            output_lines_layer.CreateFeature(output_line_feature)
 
     # Update the previous line data for the next iteration
     previous_perpendicular_line = current_line_data
+
+def traverse_downstream(point, visited_points, topology):
+    if point in visited_points:
+        return []
+
+    visited_points.add(point)
+    downstream_paths = []
+
+    downstream_points = topology[point].downstream
+
+    if not downstream_points:  # If no downstream points, it's an end-point
+        return [[point]]
+
+    for dp in downstream_points:
+        branch_path = traverse_downstream(dp, visited_points, topology)
+        for path in branch_path:
+            downstream_paths.append([point] + path)  # Prepend current point to downstream path
+
+    return downstream_paths
+
+def create_linestring_from_sorted_path(sorted_path):
+    line = ogr.Geometry(ogr.wkbLineString)
+    for point in sorted_path:
+        line.AddPoint(point[0], point[1]) 
+    return line
 
 
 def main():
@@ -235,8 +292,7 @@ def main():
     #load the polyline layer and get the polyline geometry
     input_polyline_datasrc = ogr.Open(input_polyline_path)
     input_polyline_layer = input_polyline_datasrc.GetLayer()
-    input_polyline_feature = input_polyline_layer.GetNextFeature()
-
+    #input_polyline_feature = input_polyline_layer.GetNextFeature()
 
     points = []
     for input_points_path, profile_type in [(input_points_simpel_path, 'RegulativProfilSimpel')]: #, (input_points_sammensat_path, 'RegulativProfilSammensat'), (input_points_opmaalt_path, 'OpmaaltProfil')]:
@@ -262,98 +318,108 @@ def main():
     output_lines_layer = output_lines_datasrc.GetLayer()
 
 
-    # Process each polyline feature
-    for input_polyline_feature in input_polyline_layer:
-        stream_linestring = input_polyline_feature.GetGeometryRef()
+    topology = get_layer_topology(input_polyline_layer)
 
-        all_snap_results = []
-        #breakpoint()
-        for point in points_sorted:
-            point_feature, profile_type, regulativstationering = point
-            point_att = point_feature.GetGeometryRef().Clone()
-            points_np = np.array([point_att.GetPoint()[:2]])
-        
-            snapping_results = snap_points(points_np, stream_linestring)
-            all_snap_results.append(snapping_results)
+    # Identify the source points in the river network
+    source_points = [point for point, connections in topology.items() if not connections.upstream]
+    
+    # Process each source point and its downstream branches
+    for source_point in source_points:
+        visited_points = set()
+        branch_paths = traverse_downstream(source_point, visited_points, topology)
 
-        station_to_profile_map = {}
-        stations = calculate_chainage(stream_linestring, all_snap_results)
-
-        for station_value, point_info, snap_result in zip(stations, points_sorted, all_snap_results):
-            point_feature, profile_type, regulativstationering = point_info
-            station_to_profile_map[station_value] = {
-                'profile_type': profile_type, 
-                'point_feature': point_feature, 
-                'regulativstationering': regulativstationering,
-                'snap_result': snap_result
-            }
-      
-        # Create perpendicular lines for this polyline
-        perpendicular_lines = create_perpendicular_lines_on_polylines(stream_linestring, stations, length=30)
-
-        known_stations = []
-        known_z_values = []
-        perpendicular_lines_z_values = []
-
-        # Interpolate Z-values along each perpendicular line in point stations
-        for perp_line in perpendicular_lines:
-            offset, t, x3, x4, y3, y4, perp_line_station = perp_line
+        # Process each branch path
+        for branch_path in branch_paths:
+            # Reconstruct the linestring for the branch path
+            stream_linestring = create_linestring_from_sorted_path(branch_path)
             
-             # Check if this line's station is in the station_to_profile_map
-            if perp_line_station in station_to_profile_map:
-                # Get profile info for this station
-                profile_info = station_to_profile_map[perp_line_station]
-                profile = get_profile(profile_info['point_feature'], profile_info['profile_type'])
+            all_snap_results = []
+            #breakpoint()
+            for point in points_sorted:
+                point_feature, profile_type, regulativstationering = point
+                point_att = point_feature.GetGeometryRef().Clone()
+                points_np = np.array([point_att.GetPoint()[:2]])
+              
+                snapping_results = snap_points(points_np, stream_linestring)
+                all_snap_results.append(snapping_results)
 
-                # Interpolate Z-value using the profile and offset
-                z_values = profile.interp(offset)
+            station_to_profile_map = {}
+            stations = calculate_chainage(stream_linestring, all_snap_results)
+
+            for station_value, point_info, snap_result in zip(stations, points_sorted, all_snap_results):
+                point_feature, profile_type, regulativstationering = point_info
+                station_to_profile_map[station_value] = {
+                    'profile_type': profile_type, 
+                    'point_feature': point_feature, 
+                    'regulativstationering': regulativstationering,
+                    'snap_result': snap_result
+                }
+        
+            # Create perpendicular lines for this polyline
+            perpendicular_lines = create_perpendicular_lines_on_polylines(stream_linestring, stations, length=30)
+            #breakpoint()
+            known_stations = []
+            known_z_values = []
+            perpendicular_lines_z_values = []
+
+            # Interpolate Z-values along each perpendicular line in point stations
+            for perp_line in perpendicular_lines:
+                offset, t, x3, x4, y3, y4, perp_line_station = perp_line
                 
-                # Store this station and its Z-values for later interpolation
-                known_stations.append(perp_line_station)
-                known_z_values.append(z_values)
-                perpendicular_lines_z_values.append((perp_line, z_values))
-        
+                # Check if this line's station is in the station_to_profile_map
+                if perp_line_station in station_to_profile_map:
+                    # Get profile info for this station
+                    profile_info = station_to_profile_map[perp_line_station]
+                    profile = get_profile(profile_info['point_feature'], profile_info['profile_type'])
 
-        min_station = min(known_stations, default=0)
-        max_station = max(known_stations, default=0)
-        # Second pass: Interpolate Z-values for other lines
-        for perp_line in perpendicular_lines:
-            offset, t, x3, x4, y3, y4, perp_line_station = perp_line
+                    # Interpolate Z-value using the profile and offset
+                    z_values = profile.interp(offset)
+                    
+                    # Store this station and its Z-values for later interpolation
+                    known_stations.append(perp_line_station)
+                    known_z_values.append(z_values)
+                    perpendicular_lines_z_values.append((perp_line, z_values))
+            
+            min_station = min(known_stations, default=0)
+            max_station = max(known_stations, default=0)
+            # Second pass: Interpolate Z-values for other lines
+            for perp_line in perpendicular_lines:
+                offset, t, x3, x4, y3, y4, perp_line_station = perp_line
 
-            if perp_line_station not in known_stations:
+                if perp_line_station not in known_stations:
 
-                clipped_station = max(min(perp_line_station, max_station), min_station)
+                    clipped_station = max(min(perp_line_station, max_station), min_station)
 
-                # Perform interpolation
-                x = np.array(known_stations)
-                y = np.arange(100) 
-                z = np.array(known_z_values)
+                    # Perform interpolation
+                    x = np.array(known_stations)
+                    y = np.arange(100) 
+                    z = np.array(known_z_values)
 
-                # Setup interpolation function
-                interp_func = RegularGridInterpolator((x, y), z)
+                    # Setup interpolation function
+                    interp_func = RegularGridInterpolator((x, y), z)
 
-                # Create points for interpolation
-                interp_points = np.array([[clipped_station, yi] for yi in y])
+                    # Create points for interpolation
+                    interp_points = np.array([[clipped_station, yi] for yi in y])
 
-                # Interpolate Z-values
-                interpolated_z_values = interp_func(interp_points)    
-                perpendicular_lines_z_values.append((perp_line, interpolated_z_values))
+                    # Interpolate Z-values
+                    interpolated_z_values = interp_func(interp_points)    
+                    perpendicular_lines_z_values.append((perp_line, interpolated_z_values))
 
-    previous_perpendicular_line = None
+            previous_perpendicular_line = None
 
-    # Iterate through perpendicular lines to create 3D lines
-    for line_data in perpendicular_lines_z_values:
-        perp_line, z_values = line_data
-        offset, t, x3, x4, y3, y4, perp_line_station = perp_line
+            # Iterate through perpendicular lines to create 3D lines
+            for line_data in perpendicular_lines_z_values:
+                perp_line, z_values = line_data
+                offset, t, x3, x4, y3, y4, perp_line_station = perp_line
 
-        current_line_data = (t, z_values, x3, x4, y3, y4, perp_line_station)
-        
-        if previous_perpendicular_line is not None:
-            # Call the function with the current and previous line's data
-            create_lines_with_z(current_line_data, previous_perpendicular_line, output_lines_layer)
+                current_line_data = (t, z_values, x3, x4, y3, y4, perp_line_station)
+                
+                if previous_perpendicular_line is not None:
+                    # Call the function with the current and previous line's data
+                    create_lines_with_z(current_line_data, previous_perpendicular_line, output_lines_layer)
 
-        # Update previous line data for next iteration
-        previous_perpendicular_line = current_line_data
+                # Update previous line data for next iteration
+                previous_perpendicular_line = current_line_data
 
 
     logging.info(f"processed {len(points)} points and created lines")
