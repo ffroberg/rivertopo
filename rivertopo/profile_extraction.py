@@ -6,7 +6,7 @@ from collections import namedtuple
 import argparse
 import os
 
-from rivertopo.cross_lines_z import create_perpendicular_lines
+from rivertopo.cross_lines_z import *
 
 gdal.UseExceptions()
 ogr.UseExceptions()
@@ -154,46 +154,110 @@ def get_raster_interpolator(dataset):
     
     return interpolator
 
-
-def create_perpendicular_lines_at_interval(stream_linestring, length=20, interval=20):
+def calculate_directions_for_chainage_points(stream_linestring, chainage_points):
     """
-    Create perpendicular lines over a given polyline at specified intervals.
+    Calculate direction vectors for a list of chainage points along the stream linestring.
     
-    :param stream_linestring: The input stream linestring.
-    :param length: Length of the perpendicular line (default is 30 meters).
-    :param interval: Interval distance along the linestring to create perpendicular lines.
-    :return: List of perpendicular lines and their attributes (including stationing distance).
+    :param stream_linestring: The input stream linestring (OGR geometry).
+    :param chainage_points: A list of tuples, each containing the X and Y coordinates of a chainage point.
+    :return: A list of tuples, each containing a chainage point and its direction vector.
+    """
+    directions = []
+    tolerance = 0
+    # Calculate the expanded bounding box of the stream linestring
+    minx, miny, maxx, maxy = stream_linestring.GetEnvelope()
+    bbox_expanded = (minx - tolerance, miny - tolerance, maxx + tolerance, maxy + tolerance)
+
+    for point_geometry, chainage in chainage_points:
+        x, y = point_geometry.GetX(), point_geometry.GetY()
+        
+        # Check if the chainage point is within the expanded bounding box
+        if not (bbox_expanded[0] <= x <= bbox_expanded[2] and bbox_expanded[1] <= y <= bbox_expanded[3]):
+            continue  # Skip this point as it's outside the tolerance area
+
+        closest_distance = float('inf')
+        direction_vector = (0, 0)
+        
+        for i in range(stream_linestring.GetPointCount() - 1):
+
+            point1 = stream_linestring.GetPoint(i)[:2] 
+            point2 = stream_linestring.GetPoint(i + 1)[:2]
+
+            dx = point2[0] - point1[0]
+            dy = point2[1] - point1[1]
+            temp_direction_vector = (dx, dy)
+            norm = np.linalg.norm([dx, dy])
+
+            if norm != 0:  # Normalize
+                normalized_temp_direction = (dx / norm, dy / norm)
+            else:
+                normalized_temp_direction = temp_direction_vector
+            
+            segment = ogr.Geometry(ogr.wkbLineString)
+            segment.AddPoint_2D(*point1)
+            segment.AddPoint_2D(*point2)
+            
+            chainage_geom = ogr.Geometry(ogr.wkbPoint)
+            chainage_geom.AddPoint_2D(x, y)
+            
+            distance = chainage_geom.Distance(segment)
+            
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_segment_index = i  
+                direction_vector = normalized_temp_direction
+        
+        #print(f"Chainage point at {x}, {y} with chainage {chainage} is closest to segment {closest_segment_index} with direction {direction_vector}")
+        directions.append(((x, y), direction_vector, chainage))
+
+    
+    return directions
+
+def create_perpendicular_lines_at_chainage(directions, length):
+    """
+    Create perpendicular lines at specified chainage points along the stream linestring,
+    given their direction vectors, and return their start and end coordinates along with the chainage.
+    
+    :param directions: A list of tuples, each containing a chainage point (tuple of X, Y coordinates) 
+                       and its normalized direction vector (tuple of dx, dy).
+    :param length: Length of the perpendicular line.
+    :return: A list of tuples, each containing the start coordinates (x_start, y_start),
+             end coordinates (x_end, y_end), and the chainage of the perpendicular lines created.
     """
     perpendicular_lines = []
-    total_length = stream_linestring.Length()
-    next_interval_distance = interval
 
-    while next_interval_distance <= total_length:
-        # Find the segment where this interval falls
-        cumulative_distance = 0
-        for i in range(stream_linestring.GetPointCount() - 1):
-            point1 = stream_linestring.GetPoint(i)
-            point2 = stream_linestring.GetPoint(i + 1)
+    for (x, y), (dx, dy), chainage in directions:
+        #dx, dy = direction_vector  
 
-            segment_length = np.hypot(point2[0] - point1[0], point2[1] - point1[1])
-            if cumulative_distance + segment_length >= next_interval_distance:
-                # Create a perpendicular line at this segment
-                point1_geometry = ogr.Geometry(ogr.wkbPoint)
-                point1_geometry.AddPoint(*point1)
-                point2_geometry = ogr.Geometry(ogr.wkbPoint)
-                point2_geometry.AddPoint(*point2)
+        # Normalize the perpendicular direction vector
+        norm = np.sqrt(dx**2 + dy**2)
+        dx, dy = dx / norm, dy / norm
+        #perp_dx, perp_dy = perp_dx / norm, perp_dy / norm
 
-                offset, t, x3, x4, y3, y4 = create_perpendicular_lines(point1_geometry, point2_geometry, length=length)
-                perpendicular_lines.append((offset, t, x3, x4, y3, y4, next_interval_distance))
-                break
+        # Calculate perpendicular direction by rotating the direction vector 90 degrees
+        perp_dx, perp_dy = -dy, dx  # This can be clockwise or counterclockwise
 
-            cumulative_distance += segment_length
 
-        # Update the next interval distance
-        next_interval_distance += interval
+        # Calculate start and end points of the perpendicular line, centered at the chainage point
+        x_start = x + perp_dx * (length / 2)
+        y_start = y + perp_dy * (length / 2)
+        x_end = x - perp_dx * (length / 2)
+        y_end = y - perp_dy * (length / 2)
+
+        # Append the start and end coordinates along with the chainage to the list
+        perpendicular_lines.append((x_start, y_start, x_end, y_end, chainage))
 
     return perpendicular_lines
 
+
+def process_linestring(stream_linestring, points):
+    """
+    Process a single LineString: Calculate directions and create perpendicular lines.
+    """
+    directions = calculate_directions_for_chainage_points(stream_linestring, points)
+    perpendicular_lines = create_perpendicular_lines_at_chainage(directions, 40)
+
+    return perpendicular_lines
 
 
 def main():
@@ -201,12 +265,14 @@ def main():
     argument_parser.add_argument('input_rasters', nargs='+', type=str, help= 'input DEM raster datasets to sample')
     #argument_parser.add_argument('input_raster', type=str, help= 'input DEM raster dataset to sample')
     argument_parser.add_argument('input_line', type=str, help= 'input line-object vector data source')
+    argument_parser.add_argument('input_point', type=str, help= 'input point vector data source')
     argument_parser.add_argument('output_lines', type=str, help='output geometry file')
 
     input_arguments = argument_parser.parse_args()
 
     input_raster_path = input_arguments.input_rasters
     input_lines_path = input_arguments.input_line
+    input_point_path = input_arguments.input_point
     output_lines_path = input_arguments.output_lines
 
     vrt_options = gdal.BuildVRTOptions(resampleAlg='bilinear')
@@ -216,13 +282,16 @@ def main():
 
     input_lines_datasrc = ogr.Open(input_lines_path)
     input_lines_layer = input_lines_datasrc.GetLayer()
-    input_lines_feature = input_lines_layer.GetNextFeature()
 
+    # Load point features
+    input_point_datasrc = ogr.Open(input_point_path)
+    input_point_layer = input_point_datasrc.GetLayer()
 
-    for input_lines_feature in input_lines_layer:
-        stream_linestring = input_lines_feature.GetGeometryRef()
-        
-        perpendicular_lines= create_perpendicular_lines_at_interval(stream_linestring, length=20, interval=20)
+    points = []
+    for feature in input_point_layer:
+        point_geometry = feature.GetGeometryRef().Clone()  
+        chainage = feature.GetField("chainage")  
+        points.append((point_geometry,chainage))
 
     output_lines_driver = ogr.GetDriverByName("gpkg")
     output_lines_datasrc = output_lines_driver.CreateDataSource(output_lines_path)
@@ -232,7 +301,21 @@ def main():
         geom_type=ogr.wkbLineString25D,
     )
     output_lines_layer = output_lines_datasrc.GetLayer()
- 
+
+    all_perpendicular_lines = []
+
+    for input_lines_feature in input_lines_layer:
+        geom = input_lines_feature.GetGeometryRef()
+
+        if geom.GetGeometryType() == ogr.wkbMultiLineString:
+            for i in range(geom.GetGeometryCount()):
+                single_linestring = geom.GetGeometryRef(i)
+                perpendicular_lines = process_linestring(single_linestring, points)
+                all_perpendicular_lines.extend(perpendicular_lines)
+        elif geom.GetGeometryType() == ogr.wkbLineString:
+            perpendicular_lines = process_linestring(geom, points)
+            all_perpendicular_lines.extend(perpendicular_lines)
+
     # Prepare data storage
     all_lines_data = {
         'line_ids': [],
@@ -242,12 +325,12 @@ def main():
         'distances': [],
     }
     
-    for perp_line in perpendicular_lines:
-        offset, t, x3, x4, y3, y4, perp_line_station = perp_line     
+    for perp_line in all_perpendicular_lines:
+        x_start, y_start, x_end, y_end, perp_line_station = perp_line     
      
         # Create an array of x and y coordinates along the line
-        x_coords = np.linspace(x3, x4, num=50)
-        y_coords = np.linspace(y3, y4, num=50)
+        x_coords = np.linspace(x_start, x_end, num=50)
+        y_coords = np.linspace(y_start, y_end, num=50)
 
         # Create bounding box encompassing the entire line
         input_line_bbox = BoundingBox(
@@ -256,6 +339,7 @@ def main():
             y_min=min(y_coords),
             y_max=max(y_coords)
         )
+        #breakpoint()
 
         # Get a raster window just covering this line object
         window_raster_dataset = get_raster_window(input_raster_dataset, input_line_bbox)
@@ -265,12 +349,13 @@ def main():
 
         # Interpolate z values along the line
         z_values = window_raster_interpolator((x_coords, y_coords))
-           
+        
+        
         # Create a new line geometry, including z values
         line_geometry = ogr.Geometry(ogr.wkbLineString25D)
         for x, y, z in zip(x_coords, y_coords, z_values):
             line_geometry.AddPoint(x, y, z)
-
+        
         # Calculate the distances for each row
         distances = [0]  # Initialize with the first distance as 0
         for i in range(1, len(x_coords)):
@@ -291,13 +376,13 @@ def main():
         all_lines_data['y_coords'].append(y_coords)
         all_lines_data['z_values'].append(z_values)
         all_lines_data['distances'].append(distances)
-        
+
     concatenated_data = {}
     for key in all_lines_data:
         concatenated_data[key] = np.concatenate(all_lines_data[key])
 
     # Save to .npz
-    output_file_path = r"C:\projekter\rivertopo\tests\data\vaerebro20.npz"
+    output_file_path = r"C:\projekter\rivertopo\tests\data\vejle.npz"
 
     np.savez_compressed(output_file_path, **concatenated_data)
 
